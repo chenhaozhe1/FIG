@@ -14,4 +14,4 @@ The [PHATE](https://github.com/KrishnaswamyLab/PHATE/tree/master/Python) package
 
 ### Demo notebooks 
 
-There is a [Python demo](https://github.com/KevinMoonLab/DIG/blob/master/DIG_python/EEG_demo.ipynb) on how to use FIG. 
+There is a [Python demo](https://github.com/KevinMoonLab/FIG/blob/main/FIG_demo.ipynb) on how to use FIG. 
