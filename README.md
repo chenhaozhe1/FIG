@@ -1,9 +1,9 @@
-# FIG (Dynamical Information Geometry)
+# FIG (Functional Information Geometry)
 
 
-FIG is a method for visualizing high dimensional dynamical processes. The method has been introduced in the paper preprint: 
+FIG is a method for performing dimensionality reduction on noisy, high dimensional dynamical processes with a focus on data visualization. 
 
-Haozhe Chen, Andres Felipe Duque Correa, Guy Wolf, Kevin R. Moon, "Noisy Data Visualization using Functional Data Analysis" 
+Preprint: Haozhe Chen, Andres Felipe Duque Correa, Guy Wolf, Kevin R. Moon, "Noisy Data Visualization using Functional Data Analysis," arXiv, 2024. 
 
 The link to this paper is [here](https://arxiv.org/abs/2406.03396). 
 
