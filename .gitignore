@@ -1,11 +1,20 @@
 # Large data files
-*.mat
 *.npy
+*.npz
+*.mat
 basis_rbf_MD/
+basis_fourier_MD/
+computation_time/
 
 # Python cache
 __pycache__/
+*.pyc
+
+# Jupyter
 .ipynb_checkpoints/
+
+# OS junk
+.DS_Store
 
 *.xlsx
 
