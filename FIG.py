@@ -1,177 +1,346 @@
 import numpy as np
-from sklearn.neighbors import NearestNeighbors
-from numpy import linalg as LA
+from numpy.linalg import eigh
 import skfda
-from phate import PHATE
+
 
 class FIG:
-    def __init__(self, X=None, L=30, n_components=3, normalization=None, num_basis=5, basis_type="Fourier", period=20, L1=None, L3=None):
+    """
+    Functional Information Geometry (FIG)
+
+    Pipeline:
+    1. map data into a higher-dimensional functional feature space
+       (Fourier / B-spline / RBF).
+    2. Estimate local mean and local covariance via sliding windows.
+    3. Perform tangent PCA at each point.
+    4. Compute symmetric Mahalanobis-type distances.
+
+    Output:
+    - MD: n × n symmetric distance matrix
+    """
+    def __init__(
+        self,
+        X,
+        window_size=30,
+        n_components=3,
+        normalization=None,
+        lift_type="fourier",
+        num_basis=5,
+        period=20,
+        center_window=None,
+        center_stride=None,
+        rbf_centers=None,
+        rbf_sigma=None,
+        random_state=0,
+    ):
+        """
+        Parameters
+        ----------
+        X : ndarray of shape (n, d)
+            Input data matrix, where n is the number of samples (e.g., time points)
+            and d is the ambient dimension. Each row corresponds to one observation.
+
+        window_size : int, default=30
+            Number of neighboring samples used to estimate local mean and covariance.
+            Controls the locality of tangent space estimation: smaller values yield
+            more local but noisier geometry, larger values yield smoother geometry.
+
+        n_components : int, default=3
+            Number of principal components from the functional PCA.
+            Interpreted as the intrinsic dimensionality of the data manifold.
+
+        normalization : {None, "sqrt", "exp"}, default=None
+            Normalization applied to tangent-space projections when computing
+            distances. "sqrt" corresponds to Mahalanobis-type scaling by the square
+            root of eigenvalues, while "exp" exponentially downweights directions
+            with large local variance.
+
+        lift_type : {"fourier", "bspline", "rbf"}, default="fourier"
+            Type of feature transformation applied prior to geometry estimation.
+            "fourier" and "bspline" perform coordinate-wise functional transformation,
+            while "rbf" performs multivariate nonlinear transformation.
+
+        num_basis : int, default=5
+            Dimensionality of the lifted feature space. For Fourier/B-spline transformation,
+            this is the number of basis functions per coordinate; for RBF transformation,
+            this is the number of RBF centers.
+
+        period : int or float, default=20
+            Period of the Fourier basis. Only used when lift_type="fourier";
+            ignored otherwise.
+
+        center_window : int or None, default=None
+            Window size for optional averaging of features prior to local
+            geometry estimation. Acts as temporal smoothing and noise reduction.
+
+        center_stride : int or None, default=None
+            Step size between consecutive centering windows. Must be specified
+            together with center_window.
+
+        random_state : int, default=0
+            Random seed used for RBF center selection and bandwidth estimation,
+            ensuring reproducible geometry and distances.
+        """
+
         self.X = X
-        self.L = L
+        self.n, self.d = X.shape
+
+        self.window_size = window_size
         self.n_components = n_components
         self.normalization = normalization
+
+        self.lift_type = lift_type.lower()
         self.num_basis = num_basis
-        self.basis_type = basis_type
         self.period = period
-        self.L1 = L1
-        self.L3 = L3
-        self.a_vec = self.centering() if L1 is not None and L3 is not None else self.compute_a_vec()
-        self.MD = self.fit()
 
-    def compute_KNN(self, k):
-        knn = NearestNeighbors(n_neighbors=k + 1)
-        knn.fit(self.X)
-        knn_inds = knn.kneighbors(self.X, return_distance=False)[:, 1:]
-        N = self.X[knn_inds]
-        return N, knn_inds
+        self.center_window = center_window
+        self.center_stride = center_stride
+        self.random_state = random_state
 
-    def win(self, n, L):
-        knn_inds = np.zeros((n, L), dtype=int)
-        half_L = L // 2
-        for i in range(n):
-            start = max(0, i - half_L)
-            end = min(n, i + half_L)
-            inds = np.arange(start, end)
-            if len(inds) < L:
-                inds = np.pad(inds, (0, L - len(inds)), 'edge')
-            knn_inds[i, :] = inds[:L]
-        return knn_inds
+        # User-controlled RBF hyperparameters
+        self.rbf_centers = rbf_centers
+        self.rbf_sigma = rbf_sigma
 
-    def compute_KNN_PHATE(self, k):
-        phate_emb_ = PHATE(k=20, n_components=3)
-        Y = phate_emb_.fit_transform(self.X)
+        # Cached internal parameters (for reproducibility)
+        self._rbf_centers = None
+        self._rbf_sigma = None
 
-        knn = NearestNeighbors(n_neighbors=k + 1)
-        knn.fit(Y)
-        knn_inds = knn.kneighbors(Y, return_distance=False)[:, 1:]
-        N = Y[knn_inds]
-        return N, knn_inds, Y
+        self.MD = None
 
-    def compute_a_vec(self):
-        n, d = self.X.shape
-        a_vec = []
+    # ------------------------------------------------------------------
+    # Basis construction (coordinate-wise)
+    # ------------------------------------------------------------------
 
-        for j in range(d):
+    def _build_basis(self):
+        """
+        Construct a functional basis object from skfda.
+        """
+        if self.lift_type == "fourier":
+            return skfda.representation.basis.FourierBasis(
+                domain_range=(-1, 1),
+                n_basis=self.num_basis,
+                period=self.period,
+            )
+        elif self.lift_type == "bspline":
+            return skfda.representation.basis.BSpline(
+                n_basis=self.num_basis
+            )
+        else:
+            raise ValueError(f"Unknown basis type: {self.lift_type}")
+
+    def lift_features_basis(self):
+        """
+        Coordinate-wise functional lifting.
+
+        X ∈ R^{n×d} → Φ(X) ∈ R^{n×(d·M)×1}
+        """
+        basis = self._build_basis()
+        lifted = []
+
+        for j in range(self.d):
             xj = self.X[:, j]
+            phi_xj = basis(xj).reshape(self.num_basis, self.n).T
+            lifted.append(phi_xj)
 
-            if self.basis_type == "BSpline":
-                basis = skfda.representation.basis.BSpline(n_basis=self.num_basis)
-            elif self.basis_type == "Fourier":
-                basis = skfda.representation.basis.FourierBasis(
-                    domain_range=(-20, 20),
-                    n_basis=self.num_basis,
-                    period=self.period
-                )
-            phi = basis(xj).reshape(self.num_basis, n).T
-            a_vec.append(phi)
+        lifted_X = np.hstack(lifted)
+        return lifted_X[:, :, None]
 
-        return np.hstack(a_vec).reshape(n, -1, 1)
+    # ------------------------------------------------------------------
+    # RBF feature lifting (multivariate)
+    # ------------------------------------------------------------------
 
-    def centering(self):
-        n_obs = self.X.shape[0]
-        centers = np.arange(np.ceil(self.L1 / 2), n_obs + np.ceil(self.L1 / 2), self.L3)
-        n = centers.shape[0]
-        features = self.compute_a_vec()
-        a_vec_centers = np.zeros((n, features.shape[1], 1))
+    def lift_features_rbf(self):
+        """
+        Multivariate RBF lifting.
+
+        X ∈ R^{n×d} → Φ(X) ∈ R^{n×M×1}
+        """
+        rng = np.random.default_rng(self.random_state)
+
+        # -------- centers --------
+        if self.rbf_centers is not None:
+            centers = self.rbf_centers
+        else:
+            if self._rbf_centers is None:
+                idx = rng.choice(self.n, size=min(self.num_basis, self.n), replace=False)
+                self._rbf_centers = self.X[idx]
+            centers = self._rbf_centers
+
+        # cast for speed
+        X = self.X.astype(np.float32, copy=False)
+        centers = centers.astype(np.float32, copy=False)
+
+        # -------- sigma --------
+        if self.rbf_sigma is not None:
+            sigma = float(self.rbf_sigma)
+        else:
+            if self._rbf_sigma is None:
+                sample_idx = rng.choice(self.n, size=min(300, self.n), replace=False)
+                diffs = X[sample_idx][:, None, :] - centers[None, :, :]
+                dists = np.sqrt(np.sum(diffs**2, axis=2))
+                self._rbf_sigma = max(np.median(dists[dists > 0]), 1e-6)
+            sigma = self._rbf_sigma
+
+        sigma = np.float32(sigma)
+
+        # -------- distance computation (optimized) --------
+        X_norm2 = np.sum(X**2, axis=1, keepdims=True)
+        C_norm2 = np.sum(centers**2, axis=1, keepdims=True).T
+        sq_dists = X_norm2 + C_norm2 - 2 * X @ centers.T
+        sq_dists = np.maximum(sq_dists, 0.0)
+
+        Phi = np.exp(-sq_dists / (2 * sigma**2))
+        return Phi[:, :, None]
+    # ------------------------------------------------------------------
+    # Dispatcher
+    # ------------------------------------------------------------------
+
+    def lift_features(self):
+        if self.lift_type == "rbf":
+            return self.lift_features_rbf()
+        else:
+            return self.lift_features_basis()
+
+    # ------------------------------------------------------------------
+    # Optional centering (trajectory smoothing)
+    # ------------------------------------------------------------------
+
+    def center_features(self, lifted_X):
+        """
+        Average lifted features over sliding windows.
+        This reduces noise and downsamples trajectories.
+        """
+        if self.center_window is None or self.center_stride is None:
+            return lifted_X
+
+        half = int(np.ceil(self.center_window / 2))
+        centers = np.arange(half, lifted_X.shape[0], self.center_stride)
+
+        centered = np.zeros((len(centers), lifted_X.shape[1], 1))
+
+        for i, c in enumerate(centers):
+            start = max(0, c - half)
+            end = min(lifted_X.shape[0], c + half + 1)
+            centered[i] = lifted_X[start:end].mean(axis=0)
+
+        return centered
+
+    # ------------------------------------------------------------------
+    # Local geometry
+    # ------------------------------------------------------------------
+
+    def _sliding_window_neighbors(self, n):
+        """
+        Construct index-based sliding windows.
+        """
+        half = self.window_size // 2
+        inds = np.zeros((n, self.window_size), dtype=int)
 
         for i in range(n):
-            c = centers[i]
-            phi_t = features[int(c - np.ceil(L1/2)): int(c + np.ceil(L1/2)),:]
-            mu = np.mean(phi_t, axis = 0)
-            a_vec_centers[i, :] = mu
+            start = max(0, i - half)
+            end = min(n, i + half + 1)
+            win = np.arange(start, end)
 
-        return a_vec_centers
+            if len(win) < self.window_size:
+                win = np.pad(win, (0, self.window_size - len(win)), mode="edge")
 
-    def compute_data_vec(self):
-        n, d = self.X.shape
-        data_vec = np.zeros((n, d, 1))
-        for i in range(n):
-            xi = self.X[i, :]
-            data_vec[i, :, 0] = xi.reshape(d, 1)
-        return data_vec
+            inds[i] = win[:self.window_size]
 
-    def compute_mean(self, data, knn_inds):
+        return inds
+
+    def local_mean(self, data, neighbors):
+        """
+        Local mean μ_i = average of neighbors around i.
+        """
+        mean = np.zeros_like(data)
+        for i in range(data.shape[0]):
+            mean[i, :, 0] = data[neighbors[i], :, 0].mean(axis=0)
+        return mean
+
+    def local_covariance(self, data, mean, neighbors):
+        """
+        Local covariance:
+        Σ_i = E[(x - μ_i)(x - μ_i)^T]
+        """
         n, d = data.shape[:2]
-        k = knn_inds.shape[1]
-        mean_vec = np.zeros((n, d, 1))
+        cov = np.zeros((n, d, d))
 
         for i in range(n):
-            neighbors = data[knn_inds[i]].reshape(k, d)
-            mean_vec[i, :, 0] = np.mean(neighbors, axis=0)
+            acc = np.zeros((d, d))
+            mu_i = mean[i, :, 0]
 
-        return mean_vec
+            for j in neighbors[i]:
+                diff = data[j, :, 0] - mu_i
+                acc += np.outer(diff, diff)
 
-    def compute_A_mat(self, data, mu, knn_inds):
-        n, d = data.shape[:2]
-        k = knn_inds.shape[1]
-        A = np.zeros((n, d, d))
+            cov[i] = acc / len(neighbors[i])
 
-        for i in range(n):
-            cum = np.zeros((d, d))
-            for j in range(k):
-                idx = knn_inds[i, j]
-                a_j = data[idx, :, 0]
-                mu_j = mu[idx, :, 0]
-                cum += np.outer(a_j, a_j) - np.outer(mu_j, mu_j)
-            A[i, :, :] = cum / (2 * k)
+        return cov
 
-        return A
+    def tangent_pca(self, cov):
+        """
+        Eigen-decomposition of local covariance matrices.
+        """
+        eigvals = np.zeros((cov.shape[0], self.n_components))
+        eigvecs = np.zeros((cov.shape[0], self.n_components, cov.shape[1]))
 
-    def compute_PCs(self, A):
-        n, dim = A.shape[:2]
-        EigVal = np.zeros((n, self.n_components))
-        EigVec = np.zeros((n, self.n_components, dim))
+        for i in range(cov.shape[0]):
+            w, v = eigh(cov[i])
+            idx = np.argsort(w)[::-1][:self.n_components]
+            eigvals[i] = w[idx]
+            eigvecs[i] = v[:, idx].T
 
-        for i in range(n):
-            Ai = A[i, :, :]
-            eigvals, eigvecs = LA.eig(Ai)
-            indices = np.argsort(eigvals)[::-1]
-            eigvals, eigvecs = eigvals[indices], eigvecs[:, indices]
-            EigVal[i, :] = eigvals[:self.n_components]
-            EigVec[i, :, :] = eigvecs[:, :self.n_components].T
+        return eigvals, eigvecs
 
-        return EigVal, EigVec
+    # ------------------------------------------------------------------
+    # Distances
+    # ------------------------------------------------------------------
 
-    def compute_projections(self, data, mu, EigVec, EigVal):
+    def compute_distances(self, data, mean, eigvals, eigvecs):
+        """
+        Symmetric Mahalanobis-type FIG distance.
+        """
+        eps = 1e-8
         n = data.shape[0]
         Omega = np.zeros((n, n, self.n_components))
 
         for i in range(n):
-            mu_i = mu[i, :, 0]
+            mu_i = mean[i, :, 0]
             for j in range(n):
-                a_j = data[j, :, 0]
-                theta_ijk = (a_j - mu_i).T @ EigVec[i, :, :].T
-                if self.normalization == 'sqrt':
-                    w_ijk = theta_ijk / np.sqrt(EigVal[i, :])
-                elif self.normalization == 'exp':
-                    w_ijk = theta_ijk / np.exp(-EigVal[i, :] + 1)
-                else:
-                    w_ijk = theta_ijk
-                Omega[i, j, :] = w_ijk
+                delta = data[j, :, 0] - mu_i
+                proj = delta @ eigvecs[i].T
 
-        return Omega
+                if self.normalization == "sqrt":
+                    proj /= np.sqrt(eigvals[i] + eps)
+                elif self.normalization == "exp":
+                    proj /= np.exp(-eigvals[i] + 1)
 
-    def fit(self):
-        n = self.a_vec.shape[0]
-        knn_inds = self.win(n=n, L=self.L)
-        mu_vec = self.compute_mean(data=self.a_vec, knn_inds=knn_inds)
-        A = self.compute_A_mat(data=self.a_vec, mu=mu_vec, knn_inds=knn_inds)
-        EigVal, EigVec = self.compute_PCs(A=A)
-        Omega = self.compute_projections(data=self.a_vec, mu=mu_vec, EigVec=EigVec, EigVal=EigVal)
+                Omega[i, j] = proj
 
         MD = np.zeros((n, n))
         for i in range(n):
             for j in range(n):
-                dist1 = np.linalg.norm(Omega[i, i, :] - Omega[i, j, :])
-                dist2 = np.linalg.norm(Omega[j, i, :] - Omega[j, j, :])
-                MD[i, j] = np.sqrt(dist1 ** 2 + dist2 ** 2)
+                MD[i, j] = np.sqrt(
+                    np.linalg.norm(Omega[i, j])**2 +
+                    np.linalg.norm(Omega[j, i])**2
+                )
 
         return MD
 
-    def add_noise(self, sigma):
-        n, d = self.X.shape
-        mean = np.zeros(d)
-        noise = np.random.multivariate_normal(mean, (sigma**2) * np.identity(d), n)
-        X_noise = self.X + noise
-        return X_noise
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
+    def fit(self):
+        """
+        Run the full FIG pipeline and return distance matrix.
+        """
+        lifted = self.lift_features()
+        lifted = self.center_features(lifted)
+
+        neighbors = self._sliding_window_neighbors(lifted.shape[0])
+        mean = self.local_mean(lifted, neighbors)
+        cov = self.local_covariance(lifted, mean, neighbors)
+        eigvals, eigvecs = self.tangent_pca(cov)
+
+        self.MD = self.compute_distances(lifted, mean, eigvals, eigvecs)
+        return self.MD
