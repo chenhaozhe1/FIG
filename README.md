@@ -24,7 +24,3 @@ The [PHATE](https://github.com/KrishnaswamyLab/PHATE/tree/master/Python) package
 
 There is a [Python demo](https://github.com/chenhaozhe1/FIG/blob/main/FIG_demo.ipynb) on how to use FIG.
 
-Preprint: Haozhe Chen, Andres Felipe Duque Correa, Guy Wolf, Kevin R. Moon, "Noisy Data Visualization using Functional Data Analysis," arXiv, 2024. 
-
-The link to this paper is [here](https://arxiv.org/abs/2406.03396). 
-
