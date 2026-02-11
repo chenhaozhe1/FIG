@@ -1,2 +1,4 @@
+# Large data files
+*.mat
 *.npy
 basis_rbf_MD/
